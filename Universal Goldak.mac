@@ -1,0 +1,265 @@
+!==============================================================================
+! GOLDAK MOVING HEAT SOURCE - MULTI-LAYER, AUTO-CALIBRATED, ELEMENT-WISE BIRTH
+!
+! LAYER-COUNT-AGNOSTIC VERSION:
+! Requires only ONE named selection (element component), WELD_COMP, covering
+! the ENTIRE deposited weld volume (all layers combined). Substrate/base must
+! NOT be part of WELD_COMP (it stays alive throughout).
+!
+! The macro automatically slices WELD_COMP into N_LAY equal bands along the
+! build direction (Y) -- so changing N_LAY is the ONLY thing you need to do
+! to re-run for a different number of layers. No per-layer named selections
+! to create or maintain.
+!
+! Build dir = Y, Travel dir = X, Width dir = Z.
+! Material, mesh, and convection already defined in the model.
+!
+! ASSUMPTION: layers are approximately equal height along Y. If your real
+! layers vary significantly in height, replace the uniform LAYER_H slicing
+! below with a Y-band array you supply instead.
+!==============================================================================
+
+!------------------------------------------------------------------------------
+! USER PARAMETERS (EDIT ONLY THIS BLOCK)
+!------------------------------------------------------------------------------
+
+WELD_COMP = 'WELD'        ! name of the ONE element component covering all
+                           ! deposited layers combined (create this once in
+                           ! Mechanical; it never needs to change with N_LAY)
+
+N_LAY   = 1               ! total number of layers -- CHANGE THIS to match
+                           ! your model; nothing else needs editing
+
+VEL     = 0.4/60          ! travel speed, m/s
+IDLE_T  = 480.0           ! idle time between layers, s
+
+CURR    = 495             ! current, A
+VOLT    = 27              ! voltage, V
+ETA     = 0.95            ! arc efficiency
+QTOT    = ETA*CURR*VOLT   ! net power, W
+
+AF      = 0.020           ! Goldak front semi-axis, m
+AR      = 0.030           ! Goldak rear semi-axis, m
+BDEP    = 0.003           ! Goldak depth semi-axis, m
+CWID    = 0.020           ! Goldak width semi-axis, m
+FF      = 0.6             ! front fraction (FF+FR must = 2)
+FR      = 1.4             ! rear fraction
+
+*IF,ABS(FF+FR-2.0),GT,1E-6,THEN
+   /EOF
+*ENDIF
+
+N_SUB    = 80              ! substeps to sweep source across one layer
+N_IDLE   = 96               ! substeps to resolve idle/cool period
+LOOKAHEAD = 0             ! elements within this distance ahead of the source
+                           ! get activated in advance (so the melt pool front
+                           ! always has live material to deposit heat into)
+
+KILL_RATIO = 1.0E-6        ! stiffness/conductivity multiplier for dead elements
+
+!------------------------------------------------------------------------------
+! SOLUTION SETUP
+!------------------------------------------------------------------------------
+! NOTE: /SOLU is normally already active when this macro runs as a Workbench
+! "Commands (APDL)" object placed under the Solution branch. In that case
+! MAPDL prints "You have already entered solution. The /SOLUTION command
+! is ignored." -- this is expected/harmless, not an error.
+/SOLU
+ANTYPE,TRANS
+TIMINT,ON
+KBC,1
+ESTIF,KILL_RATIO
+
+!------------------------------------------------------------------------------
+! AUTO-SLICE SETUP: compute N_LAY equal Y-bands from the whole weld volume.
+! This block runs once, up front, and is the only place layer boundaries
+! are computed. Everything below reuses YMIN_ALL/LAYER_H -- nothing is
+! hardcoded to a fixed layer count.
+!------------------------------------------------------------------------------
+ALLSEL,ALL
+CMSEL,S,%WELD_COMP%,ELEM
+
+*GET,NELEM_W,ELEM,0,COUNT
+*STATUS,NELEM_W
+
+NSLE,S
+*GET,YMIN_ALL,NODE,0,MNLOC,Y
+*GET,YMAX_ALL,NODE,0,MXLOC,Y
+ALLSEL,ALL
+
+LAYER_H = (YMAX_ALL-YMIN_ALL)/N_LAY   ! uniform layer thickness, build dir
+
+! ---- kill every layer's elements up front (substrate stays alive) ----
+ALLSEL,ALL
+*DO,ILAY,1,N_LAY
+   Y_LO = YMIN_ALL + (ILAY-1)*LAYER_H
+   Y_HI = YMIN_ALL + ILAY*LAYER_H
+   *IF,ILAY,EQ,N_LAY,THEN
+      Y_HI = YMAX_ALL + 1.0E-6      ! guard against float round-off at the top
+   *ENDIF
+   CMSEL,S,%WELD_COMP%,ELEM
+   ESEL,R,CENT,Y,Y_LO,Y_HI
+   EKILL,ALL
+   ALLSEL,ALL
+*ENDDO
+
+CURR_T = 0.0
+
+!------------------------------------------------------------------------------
+! MAIN LAYER LOOP
+!------------------------------------------------------------------------------
+*DO,ILAY,1,N_LAY
+
+   Y_LO = YMIN_ALL + (ILAY-1)*LAYER_H
+   Y_HI = YMIN_ALL + ILAY*LAYER_H
+   *IF,ILAY,EQ,N_LAY,THEN
+      Y_HI = YMAX_ALL + 1.0E-6
+   *ENDIF
+
+   ! ---- auto-detect this layer's actual bounding box ----
+   ALLSEL,ALL
+   CMSEL,S,%WELD_COMP%,ELEM
+   ESEL,R,CENT,Y,Y_LO,Y_HI
+   NSLE,S
+   *GET,XMINL,NODE,0,MNLOC,X
+   *GET,XMAXL,NODE,0,MXLOC,X
+   *GET,YMINL,NODE,0,MNLOC,Y
+   *GET,YMAXL,NODE,0,MXLOC,Y
+   *GET,ZMINL,NODE,0,MNLOC,Z
+   *GET,ZMAXL,NODE,0,MXLOC,Z
+   ALLSEL,ALL
+
+   LAY_LEN  = XMAXL-XMINL
+   Z_CENTER = (ZMINL+ZMAXL)/2.0
+   Y_SRC = YMAXL
+
+   ! ---- alternating zig-zag travel direction ----
+   *IF,MOD(ILAY,2),EQ,1,THEN
+      DIRSGN  = 1
+      X_START = XMINL
+   *ELSE
+      DIRSGN  = -1
+      X_START = XMAXL
+   *ENDIF
+
+   DT_WELD = (LAY_LEN/VEL)/N_SUB
+
+   *DO,ISUB,1,N_SUB
+
+      CURR_T = CURR_T + DT_WELD
+      TFRAC  = ISUB/N_SUB
+      X_SRC  = X_START + DIRSGN*TFRAC*LAY_LEN
+
+      ! ---- progressive element-wise activation up to source + lookahead ----
+      ALLSEL,ALL
+      CMSEL,S,%WELD_COMP%,ELEM
+      ESEL,R,CENT,Y,Y_LO,Y_HI
+      *IF,DIRSGN,EQ,1,THEN
+         ESEL,R,CENT,X,XMINL,X_SRC+LOOKAHEAD
+      *ELSE
+         ESEL,R,CENT,X,X_SRC-LOOKAHEAD,XMAXL
+      *ENDIF
+      EALIVE,ALL
+
+      ! ---- select local box around the source for heat generation ----
+      ALLSEL,ALL
+      BFEDELE,ALL,HGEN
+      
+      CMSEL,S,%WELD_COMP%,ELEM
+      ESEL,R,CENT,Y,Y_LO,Y_HI
+      ESEL,R,CENT,X,X_SRC-4*AR,X_SRC+4*AF
+      ESEL,R,CENT,Z,Z_CENTER-2*CWID,Z_CENTER+2*CWID
+
+      *GET,NSELE,ELEM,0,COUNT
+      *IF,NSELE,GT,0,THEN
+         *GET,IE,ELEM,0,NUM,MIN
+         *DO,IEL,1,NSELE
+
+            *GET,XC,ELEM,IE,CENT,X
+            *GET,YC,ELEM,IE,CENT,Y
+            *GET,ZC,ELEM,IE,CENT,Z
+
+            XI    = (XC-X_SRC)*DIRSGN
+            ETA_L = ZC-Z_CENTER
+            ZETA  = YC-Y_SRC
+
+            PII = ACOS(-1)
+            
+            *IF,XI,GE,0,THEN
+               
+              QPRE=(6*SQRT(3.)*FF*QTOT)/(PII*SQRT(PII)*AF*BDEP*CWID)
+              
+              QDENS = QPRE
+              QDENS = QDENS*EXP(-3.*(XI/AF)**2)
+              QDENS = QDENS*EXP(-3.*(ETA_L/CWID)**2)
+              QDENS = QDENS*EXP(-3.*(ZETA/BDEP)**2)
+             
+            *ELSE
+             
+             QPRE=(6*SQRT(3.)*FR*QTOT)/(PII*SQRT(PII)*AR*BDEP*CWID)
+             QDENS = QPRE
+             QDENS = QDENS*EXP(-3.*(XI/AR)**2)
+             QDENS = QDENS*EXP(-3.*(ETA_L/CWID)**2)
+             QDENS = QDENS*EXP(-3.*(ZETA/BDEP)**2)
+             
+            *ENDIF
+            
+            ! ---- Track maximum heat generation ----
+            *IF,IEL,EQ,1,THEN
+               QMAX = QDENS
+               EMAX = IE
+               XMAXQ = XC
+               YMAXQ = YC
+               ZMAXQ = ZC
+            *ENDIF
+            
+            *IF,QDENS,GT,QMAX,THEN
+              QMAX = QDENS
+              EMAX = IE
+              XMAXQ = XC
+              YMAXQ = YC
+              ZMAXQ = ZC
+            *ENDIF
+
+            BFE,IE,HGEN,1,QDENS*1.2
+
+            *GET,IE,ELEM,IE,NXTH
+         *ENDDO
+         
+         *STATUS,QMAX
+         *STATUS,EMAX
+         *STATUS,XMAXQ
+         *STATUS,YMAXQ
+         *STATUS,ZMAXQ
+         
+      *ENDIF
+
+      ALLSEL,ALL
+      TIME,CURR_T
+      DELTIM,DT_WELD,DT_WELD/4,DT_WELD*2
+      AUTOTS,OFF
+      SOLVE
+
+   *ENDDO
+
+   ! ---- clean-up: guarantee the whole layer is alive, clear heat gen ----
+   ALLSEL,ALL
+   CMSEL,S,%WELD_COMP%,ELEM
+   ESEL,R,CENT,Y,Y_LO,Y_HI
+   EALIVE,ALL
+   ALLSEL,ALL
+   BFEDELE,ALL,HGEN
+
+   ! ---- idle / cooling period (existing convection BCs remain active) ----
+   DT_IDLE = IDLE_T/N_IDLE
+   *DO,IID,1,N_IDLE
+      CURR_T = CURR_T + DT_IDLE
+      TIME,CURR_T
+      DELTIM,DT_IDLE,DT_IDLE/4,DT_IDLE*2
+      AUTOTS,OFF
+      SOLVE
+   *ENDDO
+
+*ENDDO
+
+FINISH
